@@ -31,14 +31,11 @@ import fast
 
 import mapcells
 import pacer
-import roads as roadsmod
 import staging
-import surface as surfacemod
 
 log = logging.getLogger("earthd.vegetation")
 
-VERSION = 17          # (the cached cells hold their groups: 17 for the bushes and rocks off sidewalks;
-                      # 16 for rocks and thicket on steep ground; 15 for the
+VERSION = 16          # (the cached cells hold their groups: 16 for rocks and thicket on steep ground; 15 for the
                       # Central / Eastern European beech woods; 14 for the regional rules of GitHub #110)
 TREE_MIN_M = 3.0
 CROWN_SPACING = 0.5          # tops kept this many crown radii apart (0.8 looked sparse: the user, 2026-10-13)
@@ -58,9 +55,6 @@ PATH_CLASSES = {"footway", "path", "steps", "cycleway", "bridleway", "pedestrian
 ROAD_HALF_WIDTH_M = {"motorway": 7.0, "trunk": 6.0, "primary": 5.5, "secondary": 5.0, "tertiary": 4.5,
                      "residential": 4.0, "service": 3.0, "unclassified": 3.5, "living_street": 3.0}
 ROAD_HALF_DEFAULT_M = 2.5
-# Bushes and rocks keep off the roads that get sidewalks (roads.has_sidewalks of the specs the road tiles use):
-# the carriageway, the sidewalk and VERGE_M past it. The thicket and bank bands start beyond it and keep their depth.
-VERGE_M = 1.5               # a sidewalk's margin 0.5 + a bush's radius 1
 SCATTER_CELL_M = 6.0        # the hashed scatter's grid (one candidate per cell)
 # class: (bush, rock). Tree cover (10) gets an understory (Columbia's photos: forest edges are thickets
 # of shrubs and vines under the trees; ours were bare ground between trunks), also under the canopy.
@@ -342,26 +336,20 @@ class Vegetation:
         blocked = np.zeros(h.shape, bool)
         road = np.zeros(h.shape, bool)
         curb = np.zeros(h.shape, bool)      # the roads themselves (+ TREE_PIT_M): where a street tree may not land
-        verge = np.zeros(h.shape, bool)     # roads + sidewalks (VERGE_M): no bush or rock
         push = np.zeros((3,) + h.shape, np.float32)
         push[2] = np.inf
-        around = []
         for dy in (-1, 0, 1):
             for dx in (-1, 0, 1):
                 kk = (mapcells.ZOOM, x + dx, y + dy)
                 try:
-                    around.append(cd if (dx, dy) == (0, 0)
-                                  else self.md.cell(kk, layers=("buildings", "roads", "water", "landcover")))
+                    c2 = cd if (dx, dy) == (0, 0) else self.md.cell(kk, layers=("buildings", "roads", "water"))
                 except Exception as e:          # a neighbour not at hand: its features unmasked
                     log.debug("vegetation: neighbour %s: %s", kk, e)
-        town = _town([(c2.bounds, c2.layers.get("landcover")) for c2 in around])
-        for c2 in around:
-            _mask_polys(c2.layers.get("buildings"), blocked, chm, 1.0)
-            _mask_polys(c2.layers.get("water"), blocked, chm, 0.0, kind=3)
-            _mask_roads(c2.layers.get("roads"), road, chm)
-            _mask_roads(c2.layers.get("roads"), curb, chm, push, clear=TREE_PIT_M)
-            _mask_roads(c2.layers.get("roads"), verge, chm, half=_walk_halves(c2.layers.get("roads"), town))
-        verge |= road
+                    continue
+                _mask_polys(c2.layers.get("buildings"), blocked, chm, 1.0)
+                _mask_polys(c2.layers.get("water"), blocked, chm, 0.0, kind=3)
+                _mask_roads(c2.layers.get("roads"), road, chm)
+                _mask_roads(c2.layers.get("roads"), curb, chm, push, clear=TREE_PIT_M)
         # smoothed heights (3 x 3 mean), then the local maxima by height band
         p = np.pad(h, 1, mode="edge")
         hs = sum(p[a:a + n_r, b:b + n_c] for a in range(3) for b in range(3)) / 9.0
@@ -390,7 +378,6 @@ class Vegetation:
             hs = hs.copy()
             hs[nr[ok], nc[ok]] = np.maximum(hs[nr[ok], nc[ok]], hs[rj_[ok], ri_[ok]])     # keep its height
             tops |= moved
-        tops &= ~(verge & (hs < TREE_MIN_M))        # (no canopy bush on the verge)
         blocked |= road
         jj, ii = np.nonzero(tops)
         jj, ii = _thin(jj, ii, hs[jj, ii], chm.dx)     # one top per crown (flat crowns had several)
@@ -441,9 +428,9 @@ class Vegetation:
                 _mask_polys(inf, paved, chm, 0.0, select=inf.attrs["class"].astype(str) == "parking")
         except Exception as e:                  # not at hand: scattered as before
             log.debug("vegetation: land use of %s: %s", (x, y), e)
-        scatter = self._scatter(cd, lc, blocked | paved | verge, chm, hs)
-        edge = self._edge(cd, lc, blocked, road, chm, hs, verge)
-        bank = self._bank(cd, lc, blocked, road, chm, verge)
+        scatter = self._scatter(cd, lc, blocked | paved, chm, hs)
+        edge = self._edge(cd, lc, blocked, road, chm, hs)
+        bank = self._bank(cd, lc, blocked, road, chm)
         return _concat(_concat(_concat(tree, scatter), edge), bank)
 
     def _conifer_shares(self, lat, lon, is_tree):
@@ -464,16 +451,13 @@ class Vegetation:
         share[k[ok]] = _europe_conifer_share(z[ok])
         return share
 
-    def _edge(self, cd, lc, blocked, road, chm, hs, verge=None):
-        """The thicket along forest edges beside roads (EDGE_*), outside the dry West; wider and denser on steep ground.
-        verge: the roads and their sidewalks; the band starts past it."""
+    def _edge(self, cd, lc, blocked, road, chm, hs):
+        """The thicket along forest edges beside roads (EDGE_*), outside the dry West; wider and denser on steep ground."""
         if lc is None or not road.any():
             return _empty()
         lon0, lat0, lon1, lat1 = cd.bounds
         if _dry_west(np.array([(lat0 + lat1) / 2]), np.array([(lon0 + lon1) / 2]))[0]:
             return _empty()
-        if verge is not None:
-            road, blocked = verge, blocked | verge      # (the bands are measured from the sidewalk's edge)
         near = _dilate(road, max(1, int(round(EDGE_M / chm.dx)))) & ~blocked
         steep = self.dem is not None
         band = _dilate(road, max(1, int(round(EDGE_STEEP_M / chm.dx)))) & ~blocked if steep else near
@@ -520,15 +504,13 @@ class Vegetation:
                      _hash01(GI, GJ, 26).astype(np.float32), (_hash01(GI, GJ, 27) * 360.0).astype(np.float32),
                      (0.8 + 0.4 * _hash01(GI, GJ, 28)).astype(np.float32))
 
-    def _bank(self, cd, lc, blocked, road, chm, verge=None):
-        """Rocks on the bank beside a road on steep ground (BANK_*), outside the dry West; past verge."""
+    def _bank(self, cd, lc, blocked, road, chm):
+        """Rocks on the bank beside a road on steep ground (BANK_*), outside the dry West."""
         if lc is None or self.dem is None or not road.any():
             return _empty()
         lon0, lat0, lon1, lat1 = cd.bounds
         if _dry_west(np.array([(lat0 + lat1) / 2]), np.array([(lon0 + lon1) / 2]))[0]:
             return _empty()
-        if verge is not None:
-            road, blocked = verge, blocked | verge
         band = _dilate(road, max(1, int(round(BANK_M / chm.dx)))) & ~blocked
         if not band.any():
             return _empty()
@@ -710,53 +692,19 @@ def _mask_polys(f, mask, chm, grow_m, kind=3, select=None):
                         float(chm.dx), float(chm.dy), grow_m / chm.dx)
 
 
-def _town(rasters):
-    """roads.road_specs's urban_fn from the land cover of the cells around, [(bounds, raster)]: built-up land
-    (surface.Surface.urban's rule), None without any."""
-    rasters = [(b, r) for b, r in rasters if b is not None and r is not None]
-    if not rasters:
-        return None
-
-    def urban(lat, lon):
-        lat, lon = surfacemod.warp(lat, lon)
-        out = np.zeros(lat.shape, np.uint8)
-        for (lon0, lat0, lon1, lat1), r in rasters:
-            inside = (lat >= lat0) & (lat < lat1) & (lon >= lon0) & (lon < lon1)
-            if inside.any():
-                out[inside] = r.sample(lon[inside], lat[inside])
-        return out == roadsmod.URBAN_CLASS
-    return urban
-
-
-def _walk_halves(f, urban):
-    """{feature: m from the centre line to the outside of the sidewalk and VERGE_M} for the roads of Features f that
-    get sidewalks (the road tiles' specs: carriageway width and sidewalk width). The unreadable: none."""
-    if f is None or urban is None:
-        return {}
-    try:
-        specs = roadsmod._road_specs(f, urban, None, False)     # (not road_specs: it keeps urban with f)
-    except Exception as e:
-        log.debug("vegetation: road specs: %s", e)
-        return {}
-    return {i: sp.width / 2 + sp.walk + VERGE_M for i, sp in enumerate(specs)
-            if sp is not None and roadsmod.has_sidewalks(sp)}
-
-
-def _mask_roads(f, mask, chm, push=None, clear=ROAD_CLEAR_M, half=None):
+def _mask_roads(f, mask, chm, push=None, clear=ROAD_CLEAR_M):
     """Mark road corridors (half width by class + clear) on the CHM-grid mask (footpaths left out). push (optional, (3, rows,
     cols) float32: dx, dy in px and the distance to the nearest road, inf where none) gets, per corridor
-    pixel, the move that takes it just out of its nearest road's corridor (street trees: vegetation._build).
-    half: {feature: half width m}, only these roads, as given (clear is not added)."""
+    pixel, the move that takes it just out of its nearest road's corridor (street trees: vegetation._build)."""
     if f is None:
         return
     n_r, n_c = mask.shape
     cls = f.attrs.get("class", np.full(len(f.kind), "", object))
     fast.require(63, "road_segments")
-    sel = [i for i in np.flatnonzero(f.kind == 2) if str(cls[i]) not in PATH_CLASSES and (half is None or i in half)]
+    sel = [i for i in np.flatnonzero(f.kind == 2) if str(cls[i]) not in PATH_CLASSES]
     if not sel:
         return
-    hw_m = np.array([half[i] if half is not None else ROAD_HALF_WIDTH_M.get(str(cls[i]), ROAD_HALF_DEFAULT_M) + clear
-                     for i in sel], np.float64)
+    hw_m = np.array([ROAD_HALF_WIDTH_M.get(str(cls[i]), ROAD_HALF_DEFAULT_M) + clear for i in sel], np.float64)
     # every ring's segments on the CHM grid, its half width in grid pixels (a 3857 metre is 1 / cos(lat) of a ground
     # metre), rings off the grid left out (earthfast road_segments, 2026-10-23: the per-ring Python loop it
     # replaced gave the same segments); then the distances and the nearest road's push, without the GIL

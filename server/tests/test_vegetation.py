@@ -2,7 +2,6 @@
 deterministic; tiles of items in the anchor frame."""
 import sys
 import unittest
-from unittest import mock
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,7 +10,6 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import geodesy  # noqa: E402
 import mapcells  # noqa: E402
-import mapgeom  # noqa: E402
 import vegetation as veg  # noqa: E402
 
 LAT, LON = 39.29, -76.58
@@ -104,24 +102,6 @@ class Slope:
 class OfflineDem:
     def sample(self, lat, lon, zoom):
         raise IOError("no tile")
-
-
-def road_features(md, cls="secondary", surface=None, width=None):
-    """The cell's road as mapgeom.Features (roads.road_specs reads their rules): a, b of cell_data's road."""
-    a, b = md.lonlat(100, 380), md.lonlat(100, 420)
-
-    def rules(entries, dtype):
-        if not entries:
-            return mapgeom.RuleTable(np.zeros(0, np.int32), np.zeros(0, "<U8"), np.zeros(0, np.float32),
-                                     np.zeros(0, np.float32))
-        return mapgeom.RuleTable(np.array([0], np.int32), np.array([entries[0]], dtype), np.zeros(1, np.float32),
-                                 np.ones(1, np.float32))
-    return mapgeom.Features(
-        layer="roads", ids=np.array(["r0"]), kind=np.array([mapgeom.LINE], np.uint8), part_off=np.array([0, 1], np.int64),
-        ring_off=np.array([0, 1], np.int64), coord_off=np.array([0, 2], np.int64),
-        lonlat=np.array([a, b], np.float64), attrs={"class": np.array([cls]), "subtype": np.array(["road"])},
-        rules={"surface": rules([surface] if surface else [], "<U16"), "width": rules([width] if width else [], np.float32),
-               "level": rules([], np.float32), "flags": rules([], "<U16")})
 
 
 class VegetationTest(unittest.TestCase):
@@ -304,54 +284,6 @@ class VegetationTest(unittest.TestCase):
         self.assertFalse(road[r, c].any(), "none on the road's corridor")
         self.assertTrue(veg._dilate(road, 3)[r, c].all(), "all beside it (BANK_M)")
         self.assertLess(len(bank(Slope(0.5))), len(steep), "fewer where the ground is less steep")
-
-    def test_no_bushes_on_the_sidewalk_of_a_road_that_has_one(self):
-        """Bushes keep off the sidewalk of the roads that get one (roads.has_sidewalks), no others."""
-        def bushes(cover=veg.WC["built"], **road):
-            md = FakeMapData()
-            md.cd.layers["landcover"] = Cover(cover, 0, 0, 1)
-            md.cd.layers["roads"] = road_features(md, **road)
-            chm = md.cd.layers["canopy"]
-            chm.data = np.zeros((512, 512), np.uint8)
-            for r, c in ((102, 400), (110, 400)):       # 2 m bushes: 2 px (7 m) and 8 px (30 m) from the road's line
-                chm.data[r - 1:r + 2, c - 1:c + 2] = 2
-            it = veg.Vegetation(md, None).cell(KEY)
-            mx, my = veg._to3857(it.lon, it.lat)
-            c = (mx - chm.x0) / chm.dx
-            r = (chm.y0 - my) / chm.dy
-            bush = it.kind == veg.KIND_BUSH
-            return [(bush & (np.abs(r - rr) < 1.5) & (np.abs(c - 400) < 1.5)).any() for rr in (102, 110)]
-        self.assertEqual(bushes(), [False, True], "a town's road: the bush on its sidewalk is gone, the far one stays")
-        self.assertEqual(bushes(veg.WC["tree"]), [True, True], "a country road has none")
-        self.assertEqual(bushes(width=8.0), [True, True], "a road with a mapped width is not a town street")
-        self.assertEqual(bushes(surface="dirt"), [True, True], "nor an unpaved one")
-
-    def test_thicket_and_bank_start_past_the_sidewalk(self):
-        """The thicket and the bank rocks start past the sidewalk and keep their depth."""
-        md = FakeMapData()
-        cd = md.cd
-        chm = cd.layers["canopy"]
-        road = np.zeros((512, 512), bool)
-        road[250:253, :] = True
-        verge = veg._dilate(road, 2)
-        hs = np.full((512, 512), 10.0)
-        v = veg.Vegetation(md, None)
-        v.dem = Slope(0.9)
-
-        def px(it):
-            mx, my = veg._to3857(it.lon, it.lat)
-            return (np.floor((chm.y0 - my) / chm.dy).astype(int), np.floor((mx - chm.x0) / chm.dx).astype(int))
-        for fn in (lambda vg: v._edge(cd, Cover(veg.WC["tree"], 0, 0, 1), road.copy(), road, chm, hs, vg),
-                   lambda vg: v._bank(cd, Cover(veg.WC["grass"], 0, 0, 1), road.copy(), road, chm, vg)):
-            np.testing.assert_array_equal(fn(road).lon, fn(None).lon, "no sidewalk (a country road): as before")
-        for name, items, reach in (
-                ("thicket", v._edge(cd, Cover(veg.WC["tree"], 0, 0, 1), road.copy(), road, chm, hs, verge),
-                 veg.EDGE_STEEP_M),
-                ("bank", v._bank(cd, Cover(veg.WC["grass"], 0, 0, 1), road.copy(), road, chm, verge), veg.BANK_M)):
-            self.assertGreater(len(items), 20, name)
-            r, c = px(items)
-            self.assertFalse(verge[r, c].any(), name + ": none on the sidewalk")
-            self.assertGreaterEqual(abs(r - 251).max(), 3 + 1, name + ": it keeps its depth past the sidewalk")
 
     def test_no_canopy_trees_on_barren_ground(self):
         # the canopy map misread the Bonneville Salt Flats' bright salt as ~19k trees up to 21 m: on bare ground with no
